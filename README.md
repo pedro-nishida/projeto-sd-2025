@@ -109,7 +109,7 @@ curl http://localhost/status
 
 # Escrever um valor (o Nginx roteia ao nó com menos conexões;
 # se não for o líder, o nó redireciona automaticamente)
-curl -X POST "http://localhost/write?key=foo&value=bar"
+curl -L -X POST "http://localhost/write?key=foo&value=bar"
 
 # Ler de qualquer nó
 curl "http://localhost/read?key=foo"

@@ -7,7 +7,9 @@ services:
       --http-port 8001
       --cluster-port 9001
       --peers 2:node2:9002,3:node3:9003
-      --peer-http 2:node2:8002,3:node3:8003
+      --peer-http 2:localhost:8002,3:localhost:8003
+    ports:
+      - "8001:8001"
     expose:
       - "8001"
       - "9001"
@@ -22,7 +24,9 @@ services:
       --http-port 8002
       --cluster-port 9002
       --peers 1:node1:9001,3:node3:9003
-      --peer-http 1:node1:8001,3:node3:8003
+      --peer-http 1:localhost:8001,3:localhost:8003
+    ports:
+      - "8002:8002"
     expose:
       - "8002"
       - "9002"
@@ -37,7 +41,9 @@ services:
       --http-port 8003
       --cluster-port 9003
       --peers 1:node1:9001,2:node2:9002
-      --peer-http 1:node1:8001,2:node2:8002
+      --peer-http 1:localhost:8001,2:localhost:8002
+    ports:
+      - "8003:8003"
     expose:
       - "8003"
       - "9003"
