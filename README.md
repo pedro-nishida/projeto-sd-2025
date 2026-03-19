@@ -8,20 +8,20 @@ falhas via heartbeat, conforme Tema 4 da disciplina de Sistemas Distribuídos 20
 ## 1. Arquitetura do Projeto
 
 ```
-          ┌─────────────────────────────────────────┐
-          │              Cliente HTTP                │
-          └───────────────────┬─────────────────────┘
-                              │ port 80
-                    ┌─────────▼─────────┐
-                    │       Nginx        │  least_conn load balancing
-                    └──┬─────┬─────┬────┘
-             port 8001 │     │8002 │ 8003
-          ┌────────────▼┐  ┌─▼────────┐  ┌─▼────────┐
-          │  node1 (id=1│  │ node2(id=2│  │ node3(id=3│
-          │  Follower   │  │ Follower  │  │  Leader  │
-          └──────┬──────┘  └─────┬────┘  └────┬─────┘
-                 │  cluster TCP  │             │
-                 └───────────────┴─────────────┘
+             ┌──────────────────────────────────────┐
+             │            Cliente HTTP              │
+             └─────────────────┬────────────────────┘
+                               │ port 80
+             ┌─────────────────▼────────────────────┐
+             │               Nginx                  │  least_conn load balancing
+             └──┬────────────────┬────────────────┬─┘
+                │ port 8001      │ port 8002      │ port 8003
+        ┌───────▼───────┐  ┌─────▼────────┐  ┌────▼────────┐
+        │  node1 (id=1) │  │ node2(id=2)  │  │ node3(id=3) │
+        │  Follower     │  │   Follower   │  │    Leader   │
+        └────────┬──────┘  └─────┬────────┘  └────┬────────┘
+                 │  cluster TCP  │                │
+                 └───────────────┴────────────────┘
                     port 9001 / 9002 / 9003
 ```
 
@@ -154,3 +154,65 @@ chave/valor, replicação sem pares disponíveis e eleição sem pares superiore
 | Testes de Falha, Validação e README | 2 | 10% |
 | Preparação de Slides e Apresentação | 1 | 10% |
 | **Total** | **15** | **100%** |
+
+---
+
+## 8. Descrição da execução
+
+Para entender o fluxo, é útil pensar na responsabilidade de cada arquivo:
+
+* main.rs: Lê os argumentos do terminal e dá o start nas tarefas simultâneas (threads/tasks).
+
+* node.rs: Controla quem o nó é (Líder ou Seguidor), gerencia o servidor HTTP e o servidor TCP.
+
+* message.rs: Define os formatos exatos (JSON) das mensagens que os nós enviam uns aos outros por TCP.
+
+* election.rs: Contém a lógica pura do algoritmo Bully para decidir quem é eleito como líder.
+
+Parte 1: Boot
+
+Antes de qualquer requisição, o sistema precisa subir:
+
+    1.O main.rs é chamado pelo Docker/Cargo. Ele faz o parsing das portas e dos vizinhos (peers) usando a biblioteca clap.
+
+    2.O main.rs cria o estado compartilhado daquele nó (NodeState::new), que começa sempre como Role::Follower.
+
+    3.O main.rs então usa o Tokio para "dar o play" em três tarefas que vão rodar para sempre e ao mesmo tempo:
+
+        - Chama tokio::spawn(node::cluster_server(...)) para ouvir mensagens TCP de outros nós.
+
+        - Chama tokio::spawn(node::heartbeat_monitor(...)) para ficar vigiando se o líder está vivo.
+
+        - Chama axum::serve(listener, router) para iniciar o servidor HTTP na porta 800X.
+
+Parte 2: O Caminho do curl http://localhost/status
+
+Aqui o caminho é bem direto e focado na leitura do estado:
+
+    1.O comando bate no Nginx (porta 80), que escolhe um nó e manda a requisição para a porta HTTP dele (ex: 8001).
+
+    2.A requisição cai no servidor do main.rs, que repassa imediatamente para as rotas definidas no node.rs dentro da função http_router.
+
+    3.O node.rs vê que a rota é /status e chama a função handle_status.
+
+    4.A handle_status pausa tudo rapidinho (usando um lock), lê as variáveis atuais daquele nó (seu id, se ele é líder/seguidor, etc.) e converte isso para JSON devolvendo para o cliente.
+
+    5.Importante: Note que o message.rs e o election.rs nem são chamados aqui, pois é só uma consulta de leitura simples via HTTP.
+
+Parte 3: Derrubando um Nó (A Eleição Passo a Passo)
+
+Vamos supor que o nó 3 (Líder) foi derrubado. É aqui que os arquivos interagem intensamente via TCP.
+
+    1.O loop infinito do heartbeat_monitor dentro de node.rs dos nós sobreviventes acorda a cada 500ms e checa o relógio. Ele percebe que o líder não manda sinal há mais de 3 segundos (HEARTBEAT_TIMEOUT).
+
+    2.Ainda no heartbeat_monitor, o nó muda seu próprio status de Follower para Candidate e chama a função externa: election::start_election(my_id, &peers).
+
+    3.Dentro de election.rs, o código filtra a lista de vizinhos para achar apenas aqueles com ID maior que o dele. Para cada nó maior, ele chama send_election(addr, my_id).
+
+    4.Dentro de send_election, o código precisa falar com o outro nó. Ele usa o message.rs instanciando Message::Election { candidate_id } e chama to_line(). O message.rs pega essa estrutura Rust e transforma em uma string JSON {"type":"election","candidate_id":2}\n. Essa string é enviada pelo cabo (TCP).
+
+    5.Como o nó 3 está morto, o envio falha (retorna false). O election.rs percebe que ninguém maior respondeu. Ele então chama broadcast_coordinator. Mais uma vez, usa o message.rs para criar a mensagem JSON de vitória (Message::Coordinator { leader_id }) e dispara via TCP para todo mundo que sobrou. A função retorna o próprio ID como vencedor.
+
+    6.A função heartbeat_monitor no node.rs recebe de volta o resultado. Como o ID vencedor é igual ao próprio ID, ele muda seu status para Role::Leader.
+
+    7.Imediatamente, o novo líder aciona um tokio::spawn(heartbeat_sender(...)). Essa nova rotina vai usar o message.rs a cada 1 segundo para criar a string JSON {"type":"heartbeat", ...} e enviar para os seguidores, mantendo a paz no cluster.
