@@ -134,12 +134,39 @@ Mensagens trocadas pelos nós via TCP (JSON delimitado por newline):
 
 ## 6. Testes
 
+### 6.1 Testes Unitários
 ```bash
 cargo test
 ```
 
 Cobertura das unidades principais: serialização de mensagens, store
 chave/valor, replicação sem pares disponíveis e eleição sem pares superiores.
+
+### 6.2 Teste de Integração — Eleição de Líder com Failover
+
+O script `test_election.sh` sobe o cluster, derruba o líder atual e observa
+a eleição acontecer em tempo real, verificando tolerância a falhas de ponta a ponta.
+
+**Pré-requisito:** cluster em execução via Docker Compose.
+```bash
+docker compose up --build -d
+
+chmod +x test_election.sh
+./test_election.sh
+```
+
+O script executa as seguintes etapas automaticamente:
+
+| Etapa | O que é verificado |
+|---|---|
+| Estado inicial | Todos os nós respondem; nó de maior ID é eleito líder |
+| Escrita via Nginx | Dados escritos são aceitos pelo líder e replicados com ACK |
+| Leitura em todos os nós | Consistência forte: todos os nós retornam o mesmo valor |
+| `docker stop <líder>` | Nó líder é derrubado abruptamente |
+| Polling pós-falha | Roles exibidos segundo a segundo até nova eleição convergir (~3–5 s) |
+| Escrita pós-failover | Cluster continua aceitando escritas com o novo líder |
+| `docker start <nó>` | Nó reintegrado assume papel de seguidor do novo líder |
+
 
 ---
 
