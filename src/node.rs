@@ -93,6 +93,8 @@ impl NodeState {
     }
 
     pub fn log(&mut self, msg: &str) {
+        self.log_count += 1;
+
         let formatted = format!("[#{}] [Node {}] {}", self.log_count, self.id, msg);
         eprintln!("{}", formatted);
         self.logs.push(formatted);
