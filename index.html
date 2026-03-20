@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cluster Monitor - Bully Algorithm</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background-color: #1e1e2e;
+            color: #cdd6f4;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem;
+        }
+        h1 { margin-bottom: 2rem; }
+
+        .cluster-grid {
+            display: flex;
+            gap: 2rem;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .node-card {
+            background-color: #313244;
+            border-radius: 12px;
+            padding: 1.5rem;
+            width: 250px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            border: 4px solid #45475a;
+            transition: all 0.3s ease;
+        }
+
+        .node-card.leader { border-color: #a6e3a1; box-shadow: 0 0 15px rgba(166, 227, 161, 0.2); }
+        .node-card.follower { border-color: #89b4fa; }
+        .node-card.candidate { border-color: #f9e2af; }
+        .node-card.offline { border-color: #f38ba8; opacity: 0.7; }
+
+        .status-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+            font-size: 0.8rem;
+            margin-bottom: 1rem;
+            background-color: rgba(255,255,255,0.1);
+        }
+
+        .leader .status-badge { color: #a6e3a1; }
+        .follower .status-badge { color: #89b4fa; }
+        .candidate .status-badge { color: #f9e2af; }
+        .offline .status-badge { color: #f38ba8; }
+
+        .info-row { margin: 8px 0; font-size: 0.9rem; }
+        .info-row span { font-weight: bold; }
+	.dashboard-top {
+            display: flex;
+            flex-wrap: wrap; /* Permite quebrar linha se a tela for pequena */
+            gap: 2rem;
+            width: 100%;
+            max-width: 1200px;
+            margin-bottom: 2rem;
+            align-items: stretch; /* Faz as duas caixas terem alturas harmoniosas */
+        }	
+	.kv-panel {
+	    background-color: #313244;
+            padding: 1.5rem;
+            border-radius: 12px;
+            border: 2px solid #45475a;
+            flex: 1; /* Ocupa 1 parte do espaço flex */
+            min-width: 320px;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+	}
+	.kv-panel h3 { margin-top: 0; font-size: 1.2rem; margin-bottom: 1rem; }
+	.kv-controls {
+		display: flex;
+		gap: 10px;
+		flex-direction: column;
+	}
+	.kv-controls input {
+		flex: 1;
+		padding: 10px;
+		border-radius: 6px;
+		border: 1px solid #45475a;
+		background: #1e1e2e;
+		color: #cdd6f4;
+	}
+	.kv-controls button { margin-top: 0; width: auto; padding: 10px 16px; }
+	.read-btn { background-color: #89b4fa; color: #1e1e2e; }
+        .read-btn:hover { background-color: #74a0e8; }
+        #kv-result {
+            padding: 12px;
+            background: #1e1e2e;
+            border-radius: 6px;
+            font-family: monospace;
+            color: #a6e3a1;
+        }
+        button {
+            width: 100%;
+            margin-top: 1rem;
+            padding: 8px;
+            border: none;
+            border-radius: 6px;
+            font-weight: bold;
+            cursor: pointer;
+            background-color: #45475a;
+            color: #cdd6f4;
+            transition: background 0.2s;
+        }
+        button:hover { background-color: #585b70; }
+        .offline button { background-color: #a6e3a1; color: #1e1e2e; }
+
+	.terminal-panel { flex: 2; /* Ocupa o dobro do espaço (mais largo) */
+            min-width: 400px;
+	}
+	#terminal-output {
+		background-color: #11111b;
+		border: 1px solid #45475a;
+		border-radius: 8px;
+		padding: 1rem;
+		height: 250px;
+		overflow-y: auto;
+		font-family: monospace;
+		font-size: 0.9rem;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.log-time { color: #6c7086; margin-right: 8px; }
+    </style>
+</head>
+<body>
+
+    <h1>Monitor do Cluster (Eleição Bully)</h1>
+    <div class="dashboard-top">
+        <div class="kv-panel">
+            <h3>💾 Store Distribuído</h3>
+            <div class="kv-controls">
+                <div class="input-group">
+                    <input type="text" id="kv-key" placeholder="Chave (ex: foo)">
+                    <input type="text" id="kv-value" placeholder="Valor (ex: bar)">
+                </div>
+                <div class="btn-group">
+                    <button onclick="writeKey()">Escrever (POST)</button>
+                    <button onclick="readKey()" class="read-btn">Ler (GET)</button>
+                </div>
+            </div>
+            <div id="kv-result">Aguardando operação...</div>
+        </div>
+
+        <div class="terminal-panel">
+            <h3 style="margin-top: 0; margin-bottom: 1rem;">💻 Terminal de Eventos</h3>
+            <div id="terminal-output"></div>
+        </div>
+    </div>    <div class="cluster-grid" id="cluster"></div>
+
+    <script>
+        const nodes = [
+            { id: 1, url: 'http://localhost:8001' },
+            { id: 2, url: 'http://localhost:8002' },
+            { id: 3, url: 'http://localhost:8003' }
+        ];
+
+        const clusterDiv = document.getElementById('cluster');
+
+        nodes.forEach(node => {
+            clusterDiv.innerHTML += `
+                <div class="node-card offline" id="card-${node.id}">
+                    <h2>Nó ${node.id}</h2>
+                    <div class="status-badge" id="badge-${node.id}">Desconhecido</div>
+                    <div class="info-row">Termo: <span id="term-${node.id}">-</span></div>
+                    <div class="info-row">Líder Atual: <span id="leader-${node.id}">-</span></div>
+                    <button onclick="toggleNode(${node.id}, '${node.url}')" id="btn-${node.id}">Conectando...</button>
+                </div>
+            `;
+        });
+
+        async function fetchStatus() {
+            for (const node of nodes) {
+                const card = document.getElementById(`card-${node.id}`);
+                const badge = document.getElementById(`badge-${node.id}`);
+                const term = document.getElementById(`term-${node.id}`);
+                const leader = document.getElementById(`leader-${node.id}`);
+                const btn = document.getElementById(`btn-${node.id}`);
+
+                try {
+                    const res = await fetch(`${node.url}/status`);
+                    const data = await res.json();
+
+                    // 1. Atualiza a Interface Visual (Cards)
+                    card.classList.remove('leader', 'follower', 'candidate', 'offline');
+
+                    if (!data.is_active) {
+                        card.classList.add('offline');
+                        badge.innerText = "ISOLADO";
+                        btn.innerText = "🔌 Ligar Rede";
+                    } else {
+                        const roleLower = data.role.toLowerCase();
+                        card.classList.add(roleLower);
+                        badge.innerText = data.role.toUpperCase();
+                        btn.innerText = "⚠️ Simular Falha";
+                    }
+
+                    term.innerText = data.term;
+                    leader.innerText = data.leader_id !== null ? `Nó ${data.leader_id}` : "Nenhum";
+
+                    // 2. Processa os Logs Internos do Nó com Cores Dinâmicas
+                    if (data.logs) {
+                        data.logs.forEach(logLine => {
+                            if (!seenLogs.has(logLine)) {
+                                seenLogs.add(logLine);
+                                
+                                // Define a cor baseada no Node ID
+                                let logColor = '#94e2d5'; // Cor padrão 
+                                if (logLine.includes('[Node 1]')) logColor = '#89b4fa';      // Azul
+                                else if (logLine.includes('[Node 2]')) logColor = '#f9e2af'; // Amarelo
+                                else if (logLine.includes('[Node 3]')) logColor = '#a6e3a1'; // Verde
+
+                                printLog(`[CLUSTER] ${logLine}`, logColor);
+                            }
+                        });
+                    }
+                } catch (error) {
+                    card.classList.remove('leader', 'follower', 'candidate');
+                    card.classList.add('offline');
+                    badge.innerText = "OFFLINE";
+                    term.innerText = "-";
+                    leader.innerText = "-";
+                    btn.innerText = "Tentar Reconectar";
+                }
+            }
+        }
+
+        async function toggleNode(id, url) {
+    		try {
+        	const res = await fetch(`${url}/toggle`, { method: 'POST' });
+        
+        		if (res.ok) {
+            			await fetchStatus(); 
+            			printLog(`> Comando de toggle enviado para Nó ${id}`, "#f9e2af");
+        		}
+    		} catch (error) {
+        		printLog(`> Erro ao comunicar toggle com Nó ${id}`, "#f38ba8");
+    		}
+}
+        setInterval(fetchStatus, 1000);
+        fetchStatus();
+
+	function getRandomNodeUrl() {
+            return nodes[Math.floor(Math.random() * nodes.length)].url;
+        }
+
+        const terminalOutput = document.getElementById('terminal-output');
+        const seenLogs = new Set(); // Para não repetir os logs do cluster
+
+        function printLog(msg, color = "#cdd6f4") {
+            const time = new Date().toLocaleTimeString();
+            terminalOutput.innerHTML += `<div><span class="log-time">[${time}]</span><span style="color: ${color}">${msg}</span></div>`;
+            terminalOutput.scrollTop = terminalOutput.scrollHeight;
+        }
+
+        // Pega um nó aleatório que esteja ONLINE para fazer a requisição
+        function getRandomActiveNode() {
+            const activeNodes = Array.from(document.querySelectorAll('.node-card:not(.offline)'));
+            if (activeNodes.length === 0) return nodes[0]; // fallback
+            const randomCard = activeNodes[Math.floor(Math.random() * activeNodes.length)];
+            const nodeId = parseInt(randomCard.id.split('-')[1]);
+            return nodes.find(n => n.id === nodeId);
+        }
+
+        async function writeKey() {
+            const key = document.getElementById('kv-key').value;
+            const value = document.getElementById('kv-value').value;
+            if (!key || !value) return;
+
+            const target = getRandomActiveNode();
+            printLog(`> POST /write ('${key}'='${value}') enviado para Nó ${target.id}...`, '#89b4fa');
+
+            try {
+                let res = await fetch(`${target.url}/write?key=${key}&value=${value}`, { method: 'POST' });
+                
+                if (res.status === 400) {
+                    const data = await res.json();
+                    if (data.redirect) {
+                        printLog(`> Nó ${target.id} é follower. Repassando requisição para Líder (Nó ${data.leader_id})...`, '#f9e2af');
+                        // Faz o "pulo" manual para o líder
+                        res = await fetch(`http://${data.leader_addr}/write?key=${key}&value=${value}`, { method: 'POST' });
+                    }
+                }
+
+                if (res.ok) {
+                    const data = await res.json();
+                    printLog(`> Escrita replicada com sucesso! Confirmada pelo Nó ${data.handled_by} (Líder).`, '#a6e3a1');
+                }
+            } catch (e) {
+                printLog(`> Erro de rede ao escrever: ${e.message}`, '#f38ba8');
+            }
+        }
+
+        async function readKey() {
+            const key = document.getElementById('kv-key').value;
+            if (!key) return;
+
+            const target = getRandomActiveNode();
+            printLog(`> GET /read ('${key}') enviado para Nó ${target.id}...`, '#89b4fa');
+
+            try {
+                const res = await fetch(`${target.url}/read?key=${key}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    printLog(`> Resposta recebida do Nó ${data.handled_by}: '${key}' = '${data.value}'`, '#a6e3a1');
+                } else if (res.status === 404) {
+                    printLog(`> Nó ${target.id} informou: Chave não encontrada.`, '#f38ba8');
+                }
+            } catch (e) {
+                printLog(`> Erro de rede ao ler: ${e.message}`, '#f38ba8');
+            }
+        }
+    </script>
+</body>
+</html>

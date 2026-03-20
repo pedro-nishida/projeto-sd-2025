@@ -12,11 +12,11 @@ use std::{
 };
 
 use axum::{
-    Router,
     extract::{Query, State},
     http::StatusCode,
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     routing::{get, post},
+    Router,
 };
 use serde::Deserialize;
 use tokio::{
@@ -30,6 +30,8 @@ use crate::{
     message::Message,
     sync::{self, Store},
 };
+
+use tower_http::cors::{Any, CorsLayer};
 
 /// How often the leader sends heartbeats.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
@@ -61,6 +63,9 @@ pub struct NodeState {
     /// Monotonically increasing replication sequence counter.
     pub seq: u64,
     pub election_in_progress: bool,
+    pub is_active: bool,
+    pub logs: Vec<String>,
+    pub log_count: u64,
 }
 
 impl NodeState {
@@ -81,6 +86,20 @@ impl NodeState {
             store: sync::new_store(),
             seq: 0,
             election_in_progress: false,
+            is_active: true,
+            logs: Vec::new(),
+            log_count: 0,
+        }
+    }
+
+    pub fn log(&mut self, msg: &str) {
+        let formatted = format!("[#{}] [Node {}] {}", self.log_count, self.id, msg);
+        eprintln!("{}", formatted);
+        self.logs.push(formatted);
+
+        // Keep only the last 20 logs
+        if self.logs.len() > 20 {
+            self.logs.remove(0);
         }
     }
 }
@@ -94,16 +113,31 @@ pub async fn heartbeat_sender(state: SharedState) {
     loop {
         time::sleep(HEARTBEAT_INTERVAL).await;
 
-        let (peers, term, id, is_leader) = {
+        let (peers, term, id, is_leader, is_active) = {
             let s = state.lock().unwrap();
-            (s.peers.clone(), s.term, s.id, s.role == Role::Leader)
+            (
+                s.peers.clone(),
+                s.term,
+                s.id,
+                s.role == Role::Leader,
+                s.is_active,
+            )
         };
 
         if !is_leader {
             break; // Stop the task when this node is no longer leader.
         }
 
-        let msg = Message::Heartbeat { leader_id: id, term }.to_line();
+        // If node is not active, don't send pings (fail simulation)
+        if !is_active {
+            continue;
+        }
+
+        let msg = Message::Heartbeat {
+            leader_id: id,
+            term,
+        }
+        .to_line();
         for (_, addr) in &peers {
             if let Ok(mut stream) = TcpStream::connect(addr).await {
                 let _ = stream.write_all(msg.as_bytes()).await;
@@ -117,16 +151,17 @@ pub async fn heartbeat_monitor(state: SharedState) {
     loop {
         time::sleep(Duration::from_millis(500)).await;
 
-        let (elapsed, is_leader, in_progress) = {
+        let (elapsed, is_leader, in_progress, is_active) = {
             let s = state.lock().unwrap();
             (
                 s.last_heartbeat.elapsed(),
                 s.role == Role::Leader,
                 s.election_in_progress,
+                s.is_active,
             )
         };
 
-        if is_leader || in_progress {
+        if is_leader || in_progress || !is_active {
             continue;
         }
 
@@ -135,12 +170,11 @@ pub async fn heartbeat_monitor(state: SharedState) {
                 let mut s = state.lock().unwrap();
                 s.role = Role::Candidate;
                 s.election_in_progress = true;
+
+                s.log(&format!("Heartbeat timeout — starting election"));
+
                 (s.id, s.peers.clone())
             };
-
-            tracing_log(&format!(
-                "Node {my_id}: heartbeat timeout — starting election"
-            ));
 
             let winner = election::start_election(my_id, &peers);
 
@@ -151,8 +185,11 @@ pub async fn heartbeat_monitor(state: SharedState) {
                 s.leader_id = Some(my_id);
                 s.leader_http_addr = None; // self is the leader
                 s.term += 1;
-                tracing_log(&format!("Node {my_id}: elected as leader (term {})", s.term));
-                // Reset heartbeat so the sender loop starts fresh.
+
+                let current_term = s.term;
+
+                s.log(&format!("elected as leader (term {})", current_term));
+
                 s.last_heartbeat = Instant::now();
                 drop(s);
                 tokio::spawn(heartbeat_sender(Arc::clone(&state)));
@@ -188,6 +225,10 @@ async fn handle_cluster_connection(stream: TcpStream, state: SharedState) {
     let mut lines = BufReader::new(reader).lines();
 
     while let Ok(Some(line)) = lines.next_line().await {
+        if !state.lock().unwrap().is_active {
+            continue;
+        }
+
         let Ok(msg) = Message::from_line(&line) else {
             continue;
         };
@@ -222,10 +263,7 @@ async fn handle_cluster_connection(stream: TcpStream, state: SharedState) {
                 s.election_in_progress = false;
                 s.last_heartbeat = Instant::now();
                 s.leader_http_addr = s.peer_http_addrs.get(&leader_id).cloned();
-                tracing_log(&format!(
-                    "Node {}: coordinator is now node {leader_id}",
-                    s.id
-                ));
+                s.log(&format!("Coordinator is now node {leader_id}",));
             }
 
             Message::Replicate { key, value, seq } => {
@@ -251,7 +289,7 @@ async fn handle_cluster_connection(stream: TcpStream, state: SharedState) {
 async fn trigger_election(state: SharedState) {
     let (my_id, peers) = {
         let mut s = state.lock().unwrap();
-        if s.election_in_progress {
+        if s.election_in_progress || !s.is_active {
             return;
         }
         s.election_in_progress = true;
@@ -291,6 +329,23 @@ struct WriteQuery {
     value: String,
 }
 
+/// Toggle node is_active status
+async fn handle_toggle(State(state): State<SharedState>) -> impl IntoResponse {
+    let mut s = state.lock().unwrap();
+    s.is_active = !s.is_active;
+
+    let current_status = s.is_active;
+
+    if current_status {
+        s.last_heartbeat = Instant::now();
+        s.log(&format!("Restored node"));
+    } else {
+        s.log(&format!("Fail node simulation"));
+    }
+
+    (StatusCode::OK, format!("is_active: {}", current_status)).into_response()
+}
+
 /// Returns a JSON snapshot of this node's current status.
 async fn handle_status(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.lock().unwrap();
@@ -299,28 +354,27 @@ async fn handle_status(State(state): State<SharedState>) -> impl IntoResponse {
         "role": format!("{:?}", s.role),
         "term": s.term,
         "leader_id": s.leader_id,
+        "is_active": s.is_active,
+        "logs": s.logs.clone(),
     });
     axum::Json(body)
 }
 
 /// Read a key from the store (any node can serve reads).
-async fn handle_read(
-    State(state): State<SharedState>,
-    Query(q): Query<ReadQuery>,
-) -> Response {
+async fn handle_read(State(state): State<SharedState>, Query(q): Query<ReadQuery>) -> Response {
     let s = state.lock().unwrap();
     match sync::read(&s.store, &q.key) {
-        Some(v) => (StatusCode::OK, v).into_response(),
+        Some(v) => {
+            let body = serde_json::json!({ "handled_by": s.id, "value": v });
+            (StatusCode::OK, axum::Json(body)).into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
 /// Write a key/value pair.  Only the leader accepts writes; followers redirect.
-async fn handle_write(
-    State(state): State<SharedState>,
-    Query(q): Query<WriteQuery>,
-) -> Response {
-    let (is_leader, leader_http, my_id, peers, seq) = {
+async fn handle_write(State(state): State<SharedState>, Query(q): Query<WriteQuery>) -> Response {
+    let (is_leader, leader_http, my_id, peers, seq, leader_id) = {
         let mut s = state.lock().unwrap();
         let is_leader = s.role == Role::Leader;
         let leader_http = s.leader_http_addr.clone();
@@ -331,17 +385,17 @@ async fn handle_write(
         } else {
             0
         };
-        (is_leader, leader_http, s.id, peers, seq)
+        (is_leader, leader_http, s.id, peers, seq, s.leader_id)
     };
 
     if !is_leader {
-        // Redirect the client to the current leader (load redirection).
         if let Some(leader_addr) = leader_http {
-            let url = format!(
-                "http://{}/write?key={}&value={}",
-                leader_addr, q.key, q.value
-            );
-            return Redirect::temporary(&url).into_response();
+            let body = serde_json::json!({
+                "redirect": true,
+                "leader_addr": leader_addr,
+                "leader_id": leader_id
+            });
+            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
         }
         return (StatusCode::SERVICE_UNAVAILABLE, "no leader elected yet").into_response();
     }
@@ -358,29 +412,30 @@ async fn handle_write(
 
     // Apply locally after replication.
     {
-        let s = state.lock().unwrap();
+        let mut s = state.lock().unwrap(); // Precisamos de mutabilidade (let mut) para usar o log
         sync::apply(&s.store, &q.key, &q.value);
+
+        s.log(&format!(
+            "wrote key='{}' value='{}' seq={seq}",
+            q.key, q.value
+        ));
     }
 
-    tracing_log(&format!(
-        "Node {my_id} (leader): wrote key='{}' value='{}' seq={seq}",
-        q.key, q.value
-    ));
-
-    (StatusCode::OK, "OK").into_response()
+    let body = serde_json::json!({ "redirect": false, "handled_by": my_id });
+    (StatusCode::OK, axum::Json(body)).into_response()
 }
 
 /// Build the HTTP router for this node.
 pub fn http_router(state: SharedState) -> Router {
+    let cors = CorsLayer::new().allow_methods(Any).allow_origin(Any);
+
     Router::new()
         .route("/status", get(handle_status))
         .route("/read", get(handle_read))
         .route("/write", post(handle_write).get(handle_write))
+        .route("/toggle", post(handle_toggle))
         .with_state(state)
+        .layer(cors)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-fn tracing_log(msg: &str) {
-    eprintln!("[node] {msg}");
-}
